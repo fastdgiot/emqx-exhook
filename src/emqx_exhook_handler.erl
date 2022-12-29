@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2022 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -50,6 +50,7 @@
 
 %% Utils
 -export([ message/1
+        , headers/1
         , stringfy/1
         , merge_responsed_bool/2
         , merge_responsed_message/2
@@ -61,6 +62,11 @@
         [ cast/2
         , call_fold/3
         ]).
+
+-elvis([{elvis_style, god_modules, disable}]).
+
+-define(STOP_OR_OK(Res),
+        (Res =:= ok orelse Res =:= stop)).
 
 %%--------------------------------------------------------------------
 %% Clients
@@ -102,10 +108,11 @@ on_client_authenticate(ClientInfo, AuthResult) ->
 
     case call_fold('client.authenticate', Req,
                    fun merge_responsed_bool/2) of
-        {StopOrOk, #{result := Result0}} when is_boolean(Result0) ->
+        {StopOrOk, #{result := Result0}}
+          when is_boolean(Result0) andalso ?STOP_OR_OK(StopOrOk) ->
             Result = case Result0 of true -> success; _ -> not_authorized end,
             {StopOrOk, AuthResult#{auth_result => Result, anonymous => false}};
-        _ ->
+        ignore ->
             {ok, AuthResult}
     end.
 
@@ -122,10 +129,11 @@ on_client_check_acl(ClientInfo, PubSub, Topic, Result) ->
            },
     case call_fold('client.check_acl', Req,
                    fun merge_responsed_bool/2) of
-        {StopOrOk, #{result := Result0}} when is_boolean(Result0) ->
+        {StopOrOk, #{result := Result0}}
+          when is_boolean(Result0) andalso ?STOP_OR_OK(StopOrOk) ->
             NResult = case Result0 of true -> allow; _ -> deny end,
             {StopOrOk, NResult};
-        _ -> {ok, Result}
+        ignore -> {ok, Result}
     end.
 
 on_client_subscribe(ClientInfo, Props, TopicFilters) ->
@@ -190,9 +198,11 @@ on_message_publish(Message) ->
     Req = #{message => message(Message)},
     case call_fold('message.publish', Req,
                    fun emqx_exhook_handler:merge_responsed_message/2) of
-        {StopOrOk, #{message := NMessage}} ->
+        {StopOrOk, #{message := NMessage}}
+          when ?STOP_OR_OK(StopOrOk) ->
             {StopOrOk, assign_to_message(NMessage, Message)};
-        _ -> {ok, Message}
+        ignore ->
+            {ok, Message}
     end.
 
 on_message_dropped(#message{topic = <<"$SYS/", _/binary>>}, _By, _Reason) ->
@@ -258,17 +268,58 @@ clientinfo(ClientInfo =
       cn => maybe(maps:get(cn, ClientInfo, undefined)),
       dn => maybe(maps:get(dn, ClientInfo, undefined))}.
 
-message(#message{id = Id, qos = Qos, from = From, topic = Topic, payload = Payload, timestamp = Ts}) ->
+message(#message{id = Id, qos = Qos, from = From, topic = Topic,
+                 payload = Payload, timestamp = Ts, headers = Headers}) ->
     #{node => stringfy(node()),
       id => emqx_guid:to_hexstr(Id),
       qos => Qos,
       from => stringfy(From),
       topic => Topic,
       payload => Payload,
-      timestamp => Ts}.
+      timestamp => Ts,
+      headers => headers(Headers)
+     }.
 
-assign_to_message(#{qos := Qos, topic := Topic, payload := Payload}, Message) ->
-    Message#message{qos = Qos, topic = Topic, payload = Payload}.
+headers(Headers) ->
+    Ls = [username, protocol, peerhost, allow_publish],
+    maps:fold(
+      fun
+          (_, undefined, Acc) ->
+              Acc; %% Ignore undefined value
+          (K, V, Acc) ->
+              case lists:member(K, Ls) of
+                  true ->
+                      Acc#{atom_to_binary(K) => bin(K, V)};
+                  _ ->
+                      Acc
+              end
+    end, #{}, Headers).
+
+bin(K, V) when K == username;
+               K == protocol;
+               K == allow_publish ->
+    bin(V);
+bin(peerhost, V) ->
+    bin(inet:ntoa(V)).
+
+bin(V) when is_binary(V) -> V;
+bin(V) when is_atom(V) -> atom_to_binary(V);
+bin(V) when is_list(V) -> iolist_to_binary(V).
+
+assign_to_message(InMessage = #{qos := Qos, topic := Topic,
+                                payload := Payload}, Message) ->
+    NMsg = Message#message{qos = Qos, topic = Topic, payload = Payload},
+    enrich_header(maps:get(headers, InMessage, #{}), NMsg).
+
+enrich_header(Headers, Message) ->
+    case maps:get(<<"allow_publish">>, Headers, undefined) of
+        <<"false">> ->
+            emqx_message:set_header(allow_publish, false, Message);
+        <<"true">> ->
+            emqx_message:set_header(allow_publish, true, Message);
+        _ ->
+            Message
+    end.
 
 topicfilters(Tfs) when is_list(Tfs) ->
     [#{name => Topic, qos => Qos} || {Topic, #{qos := Qos}} <- Tfs].
@@ -288,6 +339,8 @@ stringfy(Term) when is_integer(Term) ->
     integer_to_binary(Term);
 stringfy(Term) when is_atom(Term) ->
     atom_to_binary(Term, utf8);
+stringfy(Term) when is_list(Term) ->
+    list_to_binary(Term);
 stringfy(Term) ->
     unicode:characters_to_binary((io_lib:format("~0p", [Term]))).
 
@@ -299,11 +352,7 @@ merge_responsed_bool(_Req, #{type := 'IGNORE'}) ->
     ignore;
 merge_responsed_bool(Req, #{type := Type, value := {bool_result, NewBool}})
   when is_boolean(NewBool) ->
-    NReq = Req#{result => NewBool},
-    case Type of
-        'CONTINUE' -> {ok, NReq};
-        'STOP_AND_RETURN' -> {stop, NReq}
-    end;
+    {ret(Type), Req#{result => NewBool}};
 merge_responsed_bool(_Req, Resp) ->
     ?LOG(warning, "Unknown responsed value ~0p to merge to callback chain", [Resp]),
     ignore.
@@ -311,11 +360,10 @@ merge_responsed_bool(_Req, Resp) ->
 merge_responsed_message(_Req, #{type := 'IGNORE'}) ->
     ignore;
 merge_responsed_message(Req, #{type := Type, value := {message, NMessage}}) ->
-    NReq = Req#{message => NMessage},
-    case Type of
-        'CONTINUE' -> {ok, NReq};
-        'STOP_AND_RETURN' -> {stop, NReq}
-    end;
+    {ret(Type), Req#{message => NMessage}};
 merge_responsed_message(_Req, Resp) ->
     ?LOG(warning, "Unknown responsed value ~0p to merge to callback chain", [Resp]),
     ignore.
+
+ret('CONTINUE') -> ok;
+ret('STOP_AND_RETURN') -> stop.
